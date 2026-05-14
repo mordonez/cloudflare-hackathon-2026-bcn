@@ -157,6 +157,8 @@ cf.aig.latency_ms             = 2840
 
 ## Step 6 — Create the Grafana Dashboard
 
+![GateWatch Grafana Dashboard](grafana.png)
+
 1. Go to Grafana → **Dashboards → New → New Dashboard**
 2. Add a **Tempo** datasource if not already connected
 3. Suggested panels:
