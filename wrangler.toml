@@ -1,0 +1,33 @@
+name             = "gatewatch-proxy"
+main             = "worker.js"
+compatibility_date = "2024-09-23"
+workers_dev      = true
+
+# ── KV — identity store ───────────────────────────────────────────────────────
+[[kv_namespaces]]
+binding = "IDENTITIES"
+id      = "c8ef0c7b372142378f5f9af342cde562"
+
+# ── Public variables (safe to commit) ─────────────────────────────────────────
+
+[vars]
+DEFAULT_ENV = "production"
+
+# JSON map from request hostname to metadata fields.
+# Example:
+#   WORKERS_HOSTNAME_MAP = '{"opencode.gateway.example.com":{"client":"opencode","departamento":"engineering"}}'
+WORKERS_HOSTNAME_MAP = "{}"
+
+# ── Secrets — set via Wrangler CLI, never commit values ───────────────────────
+#
+#   wrangler secret put GATEWAY_BASE_URL
+#   → https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}
+#
+#   wrangler secret put GATEWAY_AUTH_HEADER
+#   → Bearer <your-cloudflare-api-token>   (omit if the gateway needs no auth)
+#
+#   wrangler secret put ADMIN_SECRET
+#   → cualquier string secreto para proteger /gatewatch/token
+#
+# Nota: el routing de modelos por departamento se configura directamente en
+# CF AI Gateway → Dynamic Routes (UI de Cloudflare), no en el worker.
