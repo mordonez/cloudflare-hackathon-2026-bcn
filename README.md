@@ -43,6 +43,13 @@ cd cloudflare-hackathon-2026-bcn
 
 ### Create the KV namespace
 
+> **Demo only — KV as a temporary identity store.**
+> For this demo, user identities and API keys are stored in Cloudflare KV.
+> This is intentionally simple: KV works great for a hackathon but is **not** the
+> recommended approach for production. In a real deployment, GateWatch should
+> validate tokens against a corporate **Identity Provider (IdP)** — see the
+> [Production identity backend](#production-identity-backend) section below.
+
 ```sh
 wrangler kv namespace create IDENTITIES
 # Copy the id from the output and update wrangler.toml:
@@ -311,3 +318,37 @@ Model routing is configured in **CF AI Gateway → Dynamic Routes** (UI), not in
 | `POST /gatewatch/token` | `x-admin-secret` | Issue or renew a user token |
 | `GET /gatewatch/tokens` | `x-admin-secret` | List all active tokens |
 | `DELETE /gatewatch/token/:key` | `x-admin-secret` | Revoke a token |
+
+---
+
+## Production identity backend
+
+The KV token store used in this demo is intentionally minimal. For production, GateWatch should delegate identity resolution to a corporate IdP. The worker's `buildEnrichedMetadata()` function already has a layered resolution chain — you only need to replace or extend the KV lookup step.
+
+### Recommended options
+
+| Option | How it works | Best for |
+|---|---|---|
+| **Cloudflare Access (Zero Trust)** | CF Access sits in front of the worker and injects a signed JWT (`Cf-Access-Jwt-Assertion`). The worker validates it with the Access public key and reads `sub`, `email`, `groups` from the payload. | Companies already using Cloudflare Access / ZTNA |
+| **OAuth 2.0 / OIDC (Okta, Entra ID, Auth0)** | The AI client obtains a short-lived access token from the IdP and sends it as `Authorization: Bearer <token>`. GateWatch calls the IdP's `/userinfo` or `/introspect` endpoint (cached in KV for TTL seconds) to resolve identity. | Standard enterprise SSO |
+| **Workload identity (mTLS / service tokens)** | CF Access service tokens or mTLS client certificates identify machine-to-machine clients. The worker reads the `Cf-Access-Client-Id` header and maps it to a service identity stored in KV or a D1 database. | Internal services, CI/CD pipelines |
+| **SCIM-provisioned KV** | Your IdP pushes user attributes to the worker via a SCIM endpoint. GateWatch stores them in KV and looks them up at request time — same flow as today but populated automatically from the directory instead of manually. | Orgs that already provision via SCIM |
+
+### Example: Cloudflare Access JWT
+
+Replace the KV lookup block in `buildEnrichedMetadata()` with:
+
+```js
+const accessJwt = request.headers.get('Cf-Access-Jwt-Assertion');
+if (accessJwt) {
+  const payload = decodeJWTPayload(accessJwt);
+  // Optionally verify signature against https://<team>.cloudflareaccess.com/cdn-cgi/access/certs
+  if (payload) {
+    meta.usuario      = payload.email  || payload.sub || 'unknown';
+    meta.departamento = payload.groups?.[0] || 'unknown'; // map groups → department
+    inferenceMethod   = 'cloudflare_access';
+  }
+}
+```
+
+No KV needed — Access handles MFA, session expiry, and revocation. GateWatch just reads the verified JWT and forwards the enriched metadata to CF AI Gateway.
