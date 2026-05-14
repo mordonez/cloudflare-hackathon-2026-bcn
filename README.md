@@ -329,26 +329,119 @@ The KV token store used in this demo is intentionally minimal. For production, G
 
 | Option | How it works | Best for |
 |---|---|---|
-| **Cloudflare Access (Zero Trust)** | CF Access sits in front of the worker and injects a signed JWT (`Cf-Access-Jwt-Assertion`). The worker validates it with the Access public key and reads `sub`, `email`, `groups` from the payload. | Companies already using Cloudflare Access / ZTNA |
+| **Cloudflare Zero Trust (Access)** | CF Access sits in front of the worker and injects a signed JWT (`Cf-Access-Jwt-Assertion`). The worker validates it with the Access public key and reads `sub`, `email`, `groups` from the payload. | Companies already using Cloudflare / ZTNA — **recommended** |
 | **OAuth 2.0 / OIDC (Okta, Entra ID, Auth0)** | The AI client obtains a short-lived access token from the IdP and sends it as `Authorization: Bearer <token>`. GateWatch calls the IdP's `/userinfo` or `/introspect` endpoint (cached in KV for TTL seconds) to resolve identity. | Standard enterprise SSO |
 | **Workload identity (mTLS / service tokens)** | CF Access service tokens or mTLS client certificates identify machine-to-machine clients. The worker reads the `Cf-Access-Client-Id` header and maps it to a service identity stored in KV or a D1 database. | Internal services, CI/CD pipelines |
 | **SCIM-provisioned KV** | Your IdP pushes user attributes to the worker via a SCIM endpoint. GateWatch stores them in KV and looks them up at request time — same flow as today but populated automatically from the directory instead of manually. | Orgs that already provision via SCIM |
 
-### Example: Cloudflare Access JWT
+---
 
-Replace the KV lookup block in `buildEnrichedMetadata()` with:
+## Cloudflare Zero Trust — recommended upgrade path
+
+Cloudflare Zero Trust (Access) is the natural production replacement for the KV token store. It is 100% Cloudflare — no new vendors — and eliminates the entire token lifecycle problem.
+
+### What changes vs. the demo
+
+| Demo (KV) | Production (Zero Trust) |
+|---|---|
+| Admin issues `gw-xxx` tokens manually | Users authenticate via Access (SSO + MFA) |
+| Identity stored in KV with TTL | Identity lives in the corporate directory (Okta, Entra, Google) |
+| `ADMIN_SECRET` protects admin routes | Access policies protect routes by email / group |
+| Token revocation is manual (`DELETE /gatewatch/token/:key`) | Revocation is instant — kill the Access session |
+| Department set at token issuance time | Department comes from the IdP group, always up to date |
+
+### Architecture with Zero Trust
+
+```
+User / AI client
+      │
+      ▼
+Cloudflare Access ──── authenticates via Okta / Entra / Google
+      │                injects signed Cf-Access-Jwt-Assertion header
+      ▼
+GateWatch Worker ───── validates JWT signature (JWKS)
+      │                extracts email → usuario
+      │                maps Access group → departamento
+      │                forwards cf-aig-metadata
+      ▼
+CF AI Gateway ─────── DLP · Dynamic Routes · OTEL → Grafana
+      │
+      ▼
+Workers AI (Kimi K2.6 / Llama 3.3)
+```
+
+### Setup
+
+**1. Create a Zero Trust application**
+
+1. Go to **Cloudflare Dashboard → Zero Trust → Access → Applications**
+2. Click **Add an application → Self-hosted**
+3. Set the application domain to your worker URL: `gatewatch-proxy.<subdomain>.workers.dev`
+4. Add an **Identity provider** (Okta, Microsoft Entra, Google Workspace, GitHub…)
+5. Create a **Policy** — e.g. allow `*@yourcompany.com`
+6. Save — Access now protects every request to the worker
+
+**2. Map Access groups to departments**
+
+In your IdP, create groups that match your departments (`legal`, `engineering`, `finance`…). Access syncs them via SCIM or OIDC claims and includes them in the JWT as the `groups` array.
+
+**3. Replace the KV lookup in the worker**
 
 ```js
+// In buildEnrichedMetadata() — replace the KV block with:
+
 const accessJwt = request.headers.get('Cf-Access-Jwt-Assertion');
 if (accessJwt) {
+  // Verify signature against Access JWKS (do this in production)
+  // const valid = await verifyAccessJwt(accessJwt, env.CF_ACCESS_AUD, env.CF_TEAM_DOMAIN);
+
   const payload = decodeJWTPayload(accessJwt);
-  // Optionally verify signature against https://<team>.cloudflareaccess.com/cdn-cgi/access/certs
   if (payload) {
-    meta.usuario      = payload.email  || payload.sub || 'unknown';
-    meta.departamento = payload.groups?.[0] || 'unknown'; // map groups → department
-    inferenceMethod   = 'cloudflare_access';
+    meta.usuario      = payload.email || payload.sub || 'unknown';
+    meta.departamento = payload.groups?.[0]           || 'unknown';
+    meta.client       = payload.client                || 'unknown';
+    inferenceMethod   = 'zero_trust';
   }
 }
 ```
 
-No KV needed — Access handles MFA, session expiry, and revocation. GateWatch just reads the verified JWT and forwards the enriched metadata to CF AI Gateway.
+**4. Verify JWT signatures (production hardening)**
+
+Access signs JWTs with a per-team key pair. Validate the signature before trusting the payload:
+
+```js
+async function verifyAccessJwt(token, audience, teamDomain) {
+  const certsUrl = `https://${teamDomain}/cdn-cgi/access/certs`;
+  const { keys } = await fetch(certsUrl).then(r => r.json());
+
+  for (const key of keys) {
+    try {
+      const cryptoKey = await crypto.subtle.importKey(
+        'jwk', key, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify'],
+      );
+      const [headerB64, payloadB64, sigB64] = token.split('.');
+      const data = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
+      const sig  = Uint8Array.from(atob(sigB64.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
+      const valid = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', cryptoKey, sig, data);
+      if (valid) return true;
+    } catch { /* try next key */ }
+  }
+  return false;
+}
+```
+
+Add `CF_ACCESS_AUD` (your Access Application audience tag) and `CF_TEAM_DOMAIN` (e.g. `yourteam.cloudflareaccess.com`) as worker secrets:
+
+```sh
+wrangler secret put CF_ACCESS_AUD
+wrangler secret put CF_TEAM_DOMAIN
+```
+
+### What you get for free
+
+- **MFA enforcement** — Access policies can require TOTP, hardware keys, or device posture
+- **Session management** — tokens expire and rotate automatically
+- **Instant revocation** — block a user in Access and they lose AI access immediately
+- **Audit log** — every authentication is logged in Zero Trust → Logs → Access
+- **Service tokens** — CI/CD pipelines use long-lived service tokens (`CF-Access-Client-Id` + `CF-Access-Client-Secret`) without going through the browser flow
+- **No token endpoint needed** — `/gatewatch/token` and `/gatewatch/tokens` become unnecessary
